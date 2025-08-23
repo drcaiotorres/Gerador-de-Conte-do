@@ -5,7 +5,7 @@ import { supabaseServer } from "@/lib/supabaseServer";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-// Opcional: latência melhor para BR
+// (opcional) menor latência no BR
 export const preferredRegion = ["gru1", "iad1"];
 
 const MODEL = process.env.OPENAI_MODEL || "gpt-5-mini";
@@ -23,7 +23,7 @@ export async function POST(
     const { instruction } = await req.json().catch(() => ({ instruction: "" }));
     const supabase = supabaseServer();
 
-    // 1) Carrega a peça atual para refinar
+    // 1) Pega a peça a ser refinada
     const { data: art, error: artErr } = await supabase
       .from("artifacts")
       .select("id, tipo, indice, content_json, edited_json, generation_id")
@@ -43,7 +43,7 @@ export async function POST(
       return NextResponse.json({ ok: false, error: "Artifact sem conteúdo para refinar." }, { status: 400 });
     }
 
-    // 2) (Opcional) Carrega contexto básico da geração/semana para ajudar a IA
+    // 2) Contexto opcional da geração
     const { data: gen } = await supabase
       .from("generations")
       .select("id, week_id, training_id_ref, payload")
@@ -55,7 +55,7 @@ export async function POST(
 
     // 3) Prompts
     const systemPrompt =
-      "Você é um editor sênior de conteúdo para Instagram. Refinar mantendo formato/tópicos e limites. Sem promessas médicas absolutas; linguagem clara, direta e ética.";
+      "Você é um editor sênior de conteúdo para Instagram. Refine mantendo formato/tópicos e limites. Não fazer promessas médicas absolutas; linguagem clara, direta e ética.";
 
     const userPrompt = [
       `## Tipo: ${art.tipo}${art.indice ? ` #${art.indice}` : ""}`,
@@ -69,7 +69,7 @@ export async function POST(
       JSON.stringify({ semana: semanaInfo, ideias: ideasSample }, null, 2),
     ].join("\n");
 
-    // 4) JSON Schema da resposta (simples: retorna um campo 'content')
+    // 4) JSON Schema simples (somente 'content')
     const schema = {
       type: "object",
       additionalProperties: false,
@@ -81,7 +81,7 @@ export async function POST(
 
     const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-    // 5) Chamada com CAST para compatibilidade de tipos do SDK
+    // 5) CHAMADA com CAST para evitar erro de tipos do SDK
     const body: any = {
       model: MODEL,
       input: [
@@ -101,7 +101,7 @@ export async function POST(
 
     const resp = await (openai as any).responses.create(body);
 
-    // 6) Extrai JSON robustamente (compatível com versões)
+    // 6) Extrai o texto/JSON com fallback robusto
     let textOut =
       resp?.output_text ??
       resp?.output?.[0]?.content?.[0]?.text ??
@@ -113,7 +113,6 @@ export async function POST(
     try {
       json = JSON.parse(textOut);
     } catch {
-      // fallback: se vier texto puro, embrulha
       json = { content: textOut };
     }
 
@@ -122,7 +121,7 @@ export async function POST(
       return NextResponse.json({ ok: false, error: "Retorno vazio da IA." }, { status: 500 });
     }
 
-    // 7) Persiste como edição do artifact
+    // 7) Salva como edição do artifact
     const { error: updErr } = await supabase
       .from("artifacts")
       .update({ edited_json: { content: refined } })
