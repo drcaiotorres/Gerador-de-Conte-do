@@ -1,3 +1,5 @@
+export const maxDuration = 300; // permite até 5 min na Vercel
+
 // app/api/generate/[weekId]/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
