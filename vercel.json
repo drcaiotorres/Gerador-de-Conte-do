@@ -1,0 +1,9 @@
+{
+  "functions": {
+    "app/api/**/route.ts": {
+      "runtime": "nodejs20.x",
+      "maxDuration": 120,
+      "memory": 1024
+    }
+  }
+}

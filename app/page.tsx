@@ -1,75 +1,175 @@
+// app/page.tsx
 import Link from "next/link";
 
 export default function Home() {
   return (
-    <main className="p-6 md:p-10 space-y-8">
-      <header className="space-y-2">
-        <h1 className="text-3xl md:text-4xl font-bold">Criador de Conteudo Semanal</h1>
-        <p className="text-gray-300">
-          PWA para planejar e gerar conteúdos semanais com IA (OpenAI).
+    <main className="py-6 sm:py-10">
+      {/* Hero */}
+      <section className="rounded-2xl bg-gradient-to-b from-[#0f141c] to-[#0b0f14] border border-white/5 p-5 sm:p-8">
+        <h1 className="text-2xl sm:text-3xl md:text-4xl font-bold leading-tight">
+          Criador de Conteúdo Semanal
+        </h1>
+        <p className="mt-2 text-sm sm:text-base text-gray-300">
+          PWA para planejar e gerar conteúdos semanais com IA (OpenAI).{" "}
+          <span className="text-gray-400">Feito por Dr. Caio Torres.</span>
         </p>
-      </header>
 
-      {/* Como usar */}
-      <section className="card p-5 rounded-xl bg-gray-900/60 border border-gray-800 space-y-4">
-        <h2 className="text-xl font-semibold">Como usar (rápido)</h2>
-        <ol className="list-decimal pl-5 space-y-2 text-gray-200">
-          <li>
-            <span className="font-medium">Temas/Subtemas:</span> cadastre semanas individualmente
-            ou use o <span className="font-medium">upload em massa</span> (XLSX/CSV) para preencher várias semanas de uma vez.
-            Use o botão <span className="font-medium">Editar</span> para ajustar qualquer semana.
-          </li>
-          <li>
-            <span className="font-medium">Ideias (globais):</span> faça upload da sua planilha com ideias (pilar/tema/assunto).
-            Elas alimentam os subtemas e a geração de conteúdo.
-          </li>
-          <li>
-            <span className="font-medium">Treinamentos:</span> cole o <em>Prompt Geral</em> do agente
-            e os prompts de cada formato (Reels, Post, Carrossel, Live, Stories). Anexe arquivos se precisar.
-          </li>
-          <li>
-            <span className="font-medium">Resultado/Saída:</span> selecione a semana e escolha um <em>formato</em>
-            (Reel, Post, Carrossel, Live ou Stories) para gerar <span className="font-medium">uma peça por vez</span>.
-            Edite no preview e use <span className="font-medium">Exportar DOCX</span>.
-          </li>
-          <li>
-            <span className="font-medium">Histórico, versões e feedback:</span> as gerações ficam salvas; você pode
-            versionar, aplicar tags e pedir ajustes específicos (ex.: “refaça o reels 2”).
-          </li>
-        </ol>
-
-        <div className="flex flex-wrap gap-3 pt-2">
-          <Link href="/temas" className="btn px-4 py-2 rounded bg-indigo-600 hover:bg-indigo-500">
-            Ir para Temas/Subtemas
-          </Link>
-          <Link href="/treinamentos" className="btn px-4 py-2 rounded bg-sky-600 hover:bg-sky-500">
-            Ir para Treinamentos
-          </Link>
-          <Link href="/resultado" className="btn px-4 py-2 rounded bg-emerald-600 hover:bg-emerald-500">
-            Ir para Resultado/Saída
-          </Link>
+        {/* Navegação rápida (rolagem horizontal no mobile) */}
+        <div className="mt-4 -mx-3 sm:mx-0">
+          <div className="flex gap-3 overflow-x-auto px-3 sm:px-0 py-1 scrollbar-thin">
+            <NavPill href="/temas" label="Temas/Subtemas" />
+            <NavPill href="/treinamentos" label="Treinamentos" />
+            <NavPill href="/resultado" label="Resultado/Saída" />
+          </div>
         </div>
       </section>
 
-      {/* Dicas de uso */}
-      <section className="card p-5 rounded-xl bg-gray-900/60 border border-gray-800 space-y-3">
-        <h2 className="text-xl font-semibold">Boas práticas</h2>
-        <ul className="list-disc pl-5 space-y-2 text-gray-200">
-          <li>Prefira gerar <span className="font-medium">uma peça por vez</span> (evita timeouts).</li>
-          <li>Mantenha os prompts objetivos, com exemplos do seu estilo e CTAs preferidos.</li>
-          <li>No upload em massa de semanas, use <code>semana_iso</code> no formato <code>YYYY-Www</code> (ex.: <code>2025-W34</code>).</li>
-          <li>As ideias globais aceitam colunas <code>pilar</code>, <code>tema</code> e <code>assunto</code> (opcionais).</li>
-          <li>Use o preview para ajustes finos e depois <span className="font-medium">Exportar DOCX</span>.</li>
-        </ul>
+      {/* Passo a passo resumido (atualizado) */}
+      <section className="mt-5 grid gap-4 sm:grid-cols-2">
+        <Card
+          title="1) Cadastre semanas ou importe planilha"
+          body={
+            <>
+              <p>
+                Em <strong>Temas/Subtemas</strong>, crie as 52 semanas do ano ou use
+                o <em>upload em massa</em>.
+              </p>
+              <ul className="mt-2 text-sm text-gray-300 list-disc pl-5 space-y-1">
+                <li>
+                  <code>semana_iso</code> (ex: 2025-W34), <code>tema_central</code>,{" "}
+                  <code>subtemas</code> (separe por <code>;</code> ou <code>,</code>).
+                </li>
+                <li>
+                  Faça também o <strong>upload de ideias globais</strong>{" "}
+                  (colunas: <code>pilar</code>, <code>tema</code>, <code>assunto</code> ou{" "}
+                  <code>texto</code>).
+                </li>
+              </ul>
+              <div className="mt-3">
+                <Link href="/temas" className="btn-primary">
+                  Abrir Temas/Subtemas
+                </Link>
+              </div>
+            </>
+          }
+        />
+        <Card
+          title="2) Treinamento Geral + prompts por formato"
+          body={
+            <>
+              <p>
+                Em <strong>Treinamentos</strong>, cole o{" "}
+                <strong>Treinamento Geral (Agente Expert)</strong> e os prompts
+                de cada formato: Reel, Post, Carrossel, Live e Stories.
+              </p>
+              <ul className="mt-2 text-sm text-gray-300 list-disc pl-5 space-y-1">
+                <li>Não crie conteúdo aqui; é só a “regra” do agente.</li>
+                <li>Você pode atualizar quando quiser; fica salvo.</li>
+              </ul>
+              <div className="mt-3">
+                <Link href="/treinamentos" className="btn-primary">
+                  Abrir Treinamentos
+                </Link>
+              </div>
+            </>
+          }
+        />
+        <Card
+          title="3) Gerar um formato por vez"
+          body={
+            <>
+              <p>
+                Em <strong>Resultado/Saída</strong>, selecione a{" "}
+                <strong>semana</strong> e o <strong>formato</strong> (Reel, Post,
+                Carrossel, Live ou Stories) e clique em <em>Gerar</em>.
+              </p>
+              <ul className="mt-2 text-sm text-gray-300 list-disc pl-5 space-y-1">
+                <li>Preview editável (Markdown/texto corrido).</li>
+                <li>Salve a versão no histórico.</li>
+                <li>Exporte em <strong>DOCX</strong>.</li>
+              </ul>
+              <div className="mt-3">
+                <Link href="/resultado" className="btn-primary">
+                  Abrir Resultado/Saída
+                </Link>
+              </div>
+            </>
+          }
+        />
+        <Card
+          title="4) Dicas rápidas"
+          body={
+            <ul className="text-sm text-gray-300 list-disc pl-5 space-y-1">
+              <li>Mobile: barra fixa com botões principais no topo.</li>
+              <li>
+                Stories: segunda sempre com caixa de perguntas; quinta lembra da
+                live.
+              </li>
+              <li>
+                Se algo travar, gere um formato por vez (já está assim) e use o
+                botão <em>Salvar versão</em>.
+              </li>
+              <li>
+                PWA: adicione à tela inicial para experiência de app no celular.
+              </li>
+            </ul>
+          }
+        />
       </section>
 
-      {/* PWA / autoria */}
-      <footer className="text-sm text-gray-400 pt-2">
-        <div>Feito por <span className="font-medium">Dr. Caio Torres</span>.</div>
-        <div className="mt-1">
-          Dica PWA: no celular, “Adicionar à Tela Inicial” para usar como app.
-        </div>
+      {/* Rodapé curto */}
+      <footer className="mt-6 text-xs text-gray-500">
+        <p>
+          © {new Date().getFullYear()} Criador de Conteúdo Semanal — feito por
+          Dr. Caio Torres.
+        </p>
       </footer>
+
+      {/* estilos utilitários inline */}
+      <style jsx>{`
+        .btn-primary {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          border-radius: 0.5rem;
+          background: #34d399; /* emerald-400/500 mix visível no fundo escuro */
+          color: #0b0f14;
+          font-weight: 600;
+          padding: 0.6rem 1rem;
+          transition: transform 0.05s ease;
+        }
+        .btn-primary:active {
+          transform: scale(0.99);
+        }
+      `}</style>
     </main>
+  );
+}
+
+/* ---------- componentes locais ---------- */
+
+function NavPill({ href, label }: { href: string; label: string }) {
+  return (
+    <Link
+      href={href}
+      className="shrink-0 rounded-xl border border-white/10 bg-[#121822] px-4 py-2 text-sm text-gray-100 hover:bg-[#141b26] active:scale-[.99] transition"
+    >
+      {label}
+    </Link>
+  );
+}
+
+function Card({
+  title,
+  body,
+}: {
+  title: string;
+  body: React.ReactNode;
+}) {
+  return (
+    <div className="rounded-xl bg-gray-900/60 border border-gray-800 p-4 sm:p-5">
+      <h3 className="text-base sm:text-lg font-semibold">{title}</h3>
+      <div className="mt-2 text-sm">{body}</div>
+    </div>
   );
 }
