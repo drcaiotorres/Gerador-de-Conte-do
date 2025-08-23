@@ -1,0 +1,9 @@
+{
+  "name": "Social Content Studio",
+  "short_name": "SCS",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0b0f12",
+  "theme_color": "#6ee7b7",
+  "icons": []
+}
