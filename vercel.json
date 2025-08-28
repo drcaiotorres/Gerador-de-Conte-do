@@ -1,9 +1,14 @@
 {
   "functions": {
-    "app/api/**/route.ts": {
+    "app/**/route.js": {
       "runtime": "nodejs20.x",
-      "maxDuration": 120,
-      "memory": 1024
+      "memory": 1024,
+      "maxDuration": 60
+    },
+    "app/**/route.ts": {
+      "runtime": "nodejs20.x",
+      "memory": 1024,
+      "maxDuration": 60
     }
   }
 }
