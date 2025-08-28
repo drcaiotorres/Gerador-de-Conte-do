@@ -5,305 +5,238 @@ import { supabaseServer } from "@/lib/supabaseServer";
 import { OPENAI_MODEL } from "@/lib/openai";
 
 export const runtime = "nodejs";
-export const maxDuration = 180;
 
-const TIPOS = new Set(["reels", "post", "carrossel", "live", "stories"]);
+// formatos permitidos
+const ALLOWED = new Set(["reel", "post", "carrossel", "live", "stories"]);
 
-const REELS_TEMPLATE = `
-### Reel P1 (Buscadores ativos)
-Headline:
-Introdução (gancho ≤3s):
-Apresentação (1 linha):
-[Bloco principal – escolha e preencha APENAS uma das estruturas abaixo]
+// orçamentos de saída por formato (tokens aproximados)
+const MAX_OUTPUT_BY_FORMAT: Record<string, number> = {
+  reel: 1400,
+  post: 1200,
+  carrossel: 1600,
+  live: 3200,     // ↑ maior para evitar corte no ATO 4/5
+  stories: 2200,
+};
 
-• Se usar Problema/Solução:
-Problema:
-Consequência:
-Solução (3–5 ações):
-Benefício:
-
-• Se usar Certo/Errado:
-Jeito errado:
-Consequência:
-Jeito certo (3–5 ações):
-Benefício:
-
-• Se usar Oportunidade/Benefício:
-Oportunidade:
-Problema que resolve:
-Exemplo:
-Benefícios:
-Como fazer (3–5 passos):
-
-CTA final (único):
-Aviso de saúde:
-
-### Reel P2 (Conscientes passivos)
-Headline:
-Introdução (gancho ≤3s):
-Apresentação (1 linha):
-[Bloco principal – escolha e preencha APENAS uma das estruturas acima]
-(complete como no P1)
-
-CTA final (único):
-Aviso de saúde:
-
-### Reel P3 (Desavisados)
-Headline:
-Introdução (gancho ≤3s):
-Apresentação (1 linha):
-[Bloco principal – escolha e preencha APENAS uma das estruturas acima]
-(complete como no P1)
-
-CTA final (único):
-Aviso de saúde:
-`.trim();
-
-const POST_TEMPLATE = `
-### Post Estático (Educação)
-Título (≤ 60c):
-Linha de apoio (≤ 90c):
-Corpo (5–8 linhas, frases curtas):
-Prova/Autoridade (1 linha):
-CTA (único):
-Aviso de saúde (1 linha):
-Legenda (2–3 parágrafos curtos, pronta para copiar):
-`.trim();
-
-/** Extrai TEXTO apenas dos blocos válidos do Responses API */
+// utilitário: extrai texto do Responses API, com vários fallbacks
 function extractText(resp: any): string {
-  // caminho direto
-  if (typeof resp?.output_text === "string" && resp.output_text.trim()) {
-    return resp.output_text.trim();
-  }
-
-  const chunks: string[] = [];
-
-  // varre somente outputs -> messages -> content e pega somente tipos textuais
-  const outputs = resp?.output;
-  if (Array.isArray(outputs)) {
-    for (const out of outputs) {
-      const content = out?.content;
-      if (Array.isArray(content)) {
-        for (const c of content) {
-          // prioriza blocos válidos
-          if (c?.type === "output_text" && c?.text?.value) {
-            chunks.push(String(c.text.value));
-          } else if (c?.type === "text" && typeof c?.text === "string") {
-            chunks.push(c.text);
-          } else if (c?.text?.value && typeof c.text.value === "string") {
-            chunks.push(c.text.value);
-          }
-          // ignora tipos: reasoning, tool_use, input_text etc.
+  try {
+    if (typeof resp.output_text === "string" && resp.output_text.trim()) {
+      return resp.output_text;
+    }
+    const c0 = resp?.output?.[0]?.content?.[0];
+    if (c0?.type === "output_text" && typeof c0?.text === "string") {
+      return c0.text;
+    }
+    const parts: string[] = [];
+    for (const out of resp?.output ?? []) {
+      for (const c of out?.content ?? []) {
+        if (c?.type === "output_text" && typeof c?.text === "string") {
+          parts.push(c.text);
         }
       }
     }
-  }
-
-  // fallback comum
-  if (chunks.length === 0) {
-    const tryJoin =
-      resp?.output?.[0]?.content
-        ?.map((c: any) => c?.text?.value || c?.text)
-        ?.filter((v: any) => typeof v === "string")
-        ?.join("\n");
-    if (tryJoin && String(tryJoin).trim()) {
-      return String(tryJoin).trim();
-    }
-  }
-
-  return chunks.join("\n").trim();
+    if (parts.length) return parts.join("\n\n");
+  } catch {}
+  return "";
 }
 
-export async function POST(
-  _req: NextRequest,
-  ctx: { params: { weekId: string; tipo: string } }
-) {
+// gera um prompt de “continue” quando Live veio incompleto
+function buildLiveContinuePrompt(already: string) {
+  return [
+    "Você começou a escrever um roteiro de LIVE com 5 ATOS e parou antes de concluir.",
+    "Abaixo está o texto que você já escreveu (NÃO repita este conteúdo):",
+    "----- INÍCIO DO CONTEÚDO JÁ ESCRITO -----",
+    already,
+    "----- FIM DO CONTEÚDO JÁ ESCRITO -----",
+    "",
+    "Agora, **complete apenas o que falta** seguindo a estrutura:",
+    "• ATO 4: Recapitulação e Reforço (≈ 5 min)",
+    "  - Resuma os pontos essenciais (bullets claros).",
+    "  - Faça 1 pergunta de verificação de entendimento para engajar.",
+    "• ATO 5: Chamada Final (≈ 1 min)",
+    "  - Convite para comentar no gravado (o que ajudou).",
+    "  - Chamado para compartilhar.",
+    "",
+    "Regras:",
+    "- Não reescreva os ATOS já concluídos.",
+    "- Mantenha tom: confiança serena, didático, sem promessas absolutas.",
+    "- Entregue o texto pronto para uso, com títulos 'ATO 4' e 'ATO 5'.",
+  ].join("\n");
+}
+
+function buildContextoSemana(week: any) {
+  const sub = Array.isArray(week?.subtemas) ? week.subtemas : [];
+  const subList = sub.length ? `\nSubtemas: ${sub.join(", ")}` : "";
+  return `Semana: ${week?.semana_iso}\nTema central: ${week?.tema_central}${subList}`;
+}
+
+function pickPromptFormato(train: any, tipo: string): string {
+  switch (tipo) {
+    case "reel": return train?.prompt_reels || "";
+    case "post": return train?.prompt_post || "";
+    case "carrossel": return train?.prompt_carrossel || "";
+    case "live": return train?.prompt_live || "";
+    case "stories": return train?.prompt_stories || "";
+    default: return "";
+  }
+}
+
+export async function POST(req: NextRequest, { params }: { params: { weekId: string; tipo: string } }) {
+  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  const supabase = supabaseServer();
+
   try {
-    const { weekId, tipo } = ctx.params || ({} as any);
-    if (!weekId || !tipo || !TIPOS.has(tipo)) {
-      return NextResponse.json({ ok: false, error: "Parâmetros inválidos." }, { status: 400 });
+    const weekId = params.weekId;
+    const tipo = (params.tipo || "").toLowerCase();
+
+    if (!ALLOWED.has(tipo)) {
+      return NextResponse.json({ ok: false, error: `Formato inválido: ${tipo}` }, { status: 400 });
     }
 
-    const supabase = supabaseServer();
-
-    // 1) Semana
-    const { data: week, error: werr } = await supabase
+    // 1) Carrega semana
+    const { data: week, error: eWeek } = await supabase
       .from("weeks")
       .select("*")
       .eq("id", weekId)
       .single();
 
-    if (werr || !week) {
+    if (eWeek || !week) {
       return NextResponse.json({ ok: false, error: "Semana não encontrada." }, { status: 404 });
     }
 
-    // 2) Treinamento mais recente
-    const { data: training } = await supabase
+    // 2) Carrega o treinamento mais recente
+    const { data: trainings, error: eTr } = await supabase
       .from("trainings")
       .select("*")
       .order("updated_at", { ascending: false })
-      .limit(1)
-      .maybeSingle();
+      .limit(1);
 
-    // 3) Ideias (amostra)
-    const { data: ideias } = await supabase
-      .from("ideas")
-      .select("pilar, tema, assunto, texto")
-      .order("created_at", { ascending: false })
-      .limit(60);
-
-    const ideiasLista =
-      (ideias || [])
-        .map((i) => {
-          const base =
-            i?.texto ||
-            [i?.pilar, i?.tema, i?.assunto].filter(Boolean).join(" | ");
-          return `- ${base}`;
-        })
-        .join("\n") || "- (sem ideias cadastradas)";
-
-    // 4) Prompts base
-    const promptGeral =
-      training?.prompt_geral ||
-      "Você é um estrategista de conteúdo médico. Produza conteúdo informativo, ético e claro em PT-BR.";
-
-    const pickFormatoPrompt = () => {
-      switch (tipo) {
-        case "reels":
-          return (
-            training?.prompt_reels ||
-            "Objetivo: Gerar 3 roteiros de Reels (≤60s), texto corrido, com tópicos fixos para teleprompter."
-          );
-        case "post":
-          return (
-            training?.prompt_post ||
-            "Objetivo: Post estático educativo com título forte, linha de apoio, corpo em frases curtas, prova/autoridade, CTA único, aviso de saúde e legenda pronta."
-          );
-        case "carrossel":
-          return (
-            training?.prompt_carrossel ||
-            "Crie um carrossel educacional com 8 slides (título, fatos/mitos, consequências, solução, CTA)."
-          );
-        case "live":
-          return training?.prompt_live || "Crie roteiro de live com atos 1–5, tópicos práticos e CTAs.";
-        case "stories":
-          return training?.prompt_stories || "Crie sequência de Stories para 7 dias com interações e CTAs.";
-      }
-    };
-
-    const promptFormato = pickFormatoPrompt()!;
-    const tema = week.tema_central || "Tema não definido";
-    const subtemasArr = Array.isArray(week.subtemas)
-      ? week.subtemas
-      : typeof week.subtemas === "string"
-      ? week.subtemas.split(",").map((s: string) => s.trim()).filter(Boolean)
-      : [];
-
-    // 5) Prompt do usuário (obriga formato fechado em Reels e Post)
-    let userPrompt: string;
-    if (tipo === "reels") {
-      userPrompt = `
-SEMANA: ${week.semana_iso}
-TEMA CENTRAL: ${tema}
-SUBTEMAS: ${subtemasArr.join(" | ") || "(sem subtemas)"}
-
-BANCO DE IDEIAS (amostra):
-${ideiasLista}
-
-INSTRUÇÃO DO FORMATO (REELS, TELEPROMPTER):
-${promptFormato}
-
-Diretrizes obrigatórias:
-- Tom: confiança serena, didático, empático, sem hype. Frases curtas.
-- Hook ≤3s, sem clickbait.
-- Valor prático: 3–5 ações objetivas.
-- 1 CTA único por roteiro.
-- Saúde/ética: informativo; não substitui avaliação individual; evitar promessas absolutas.
-- Sem hashtags, sem comentários extras.
-- Preencha APENAS uma das estruturas (Problema/Solução OU Certo/Errado OU Oportunidade/Benefício) em cada roteiro.
-- Entregue a SAÍDA exatamente no seguinte formato, preenchendo os campos:
-
-${REELS_TEMPLATE}
-      `.trim();
-    } else if (tipo === "post") {
-      userPrompt = `
-SEMANA: ${week.semana_iso}
-TEMA CENTRAL: ${tema}
-SUBTEMAS: ${subtemasArr.join(" | ") || "(sem subtemas)"}
-
-BANCO DE IDEIAS (amostra):
-${ideiasLista}
-
-INSTRUÇÃO DO FORMATO (POST ESTÁTICO):
-${promptFormato}
-
-Diretrizes obrigatórias:
-- Linguagem simples, frases curtas, sem hype.
-- 5–8 linhas no corpo (texto corrido, sem bullets).
-- 1 CTA único.
-- Aviso de saúde: informativo; não substitui avaliação individual.
-- Entregue a SAÍDA exatamente no seguinte formato (preencha todos os campos):
-
-${POST_TEMPLATE}
-      `.trim();
-    } else {
-      userPrompt = `
-SEMANA: ${week.semana_iso}
-TEMA CENTRAL: ${tema}
-SUBTEMAS: ${subtemasArr.join(" | ") || "(sem subtemas)"}
-
-BANCO DE IDEIAS (amostra):
-${ideiasLista}
-
-FORMATO SOLICITADO: ${tipo.toUpperCase()}
-INSTRUÇÃO DO FORMATO:
-${promptFormato}
-
-Regras:
-- Linguagem simples, ética e informativa (não substitui avaliação individual).
-- Entregue a SAÍDA em Markdown pronto para copiar/editar.
-- Seja direto e prático. Evite jargões sem explicar.
-      `.trim();
+    if (eTr || !trainings?.length) {
+      return NextResponse.json({ ok: false, error: "Treinamento não encontrado. Preencha em /treinamentos." }, { status: 400 });
     }
 
-    // 6) OpenAI — tokens por formato
-    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
+    const training = trainings[0];
+    const promptGeral = (training?.prompt_geral || "").trim();
+    const promptFormato = (pickPromptFormato(training, tipo) || "").trim();
 
-    const maxTokensMap: Record<string, number> = {
-      reels: 3200,
-      post: 2300,
-      carrossel: 2200,
-      live: 2600,
-      stories: 2400,
-    };
+    if (!promptFormato) {
+      return NextResponse.json({ ok: false, error: `Prompt do formato (${tipo}) não preenchido em /treinamentos.` }, { status: 400 });
+    }
+
+    // 3) Contexto de ideias (opcional: amostra simples)
+    const { data: ideas } = await supabase
+      .from("ideas")
+      .select("texto")
+      .order("created_at", { ascending: false })
+      .limit(10);
+
+    const ideiasTexto = (ideas || [])
+      .map((i: any) => i?.texto)
+      .filter(Boolean)
+      .join("\n- ");
+
+    // 4) Prompt final
+    const contextoSemana = buildContextoSemana(week);
+    const system = [
+      "Você é um estrategista de conteúdo que escreve em PT-BR, tom: confiança serena, didático, empático, ético.",
+      "Evite promessas absolutas e jargão; se usar termo médico, explique em 1 linha simples.",
+      "Siga fielmente as orientações do prompt específico do formato.",
+    ].join("\n");
+
+    const usuario = [
+      "=== TREINAMENTO GERAL ===",
+      promptGeral || "(vazio)",
+      "",
+      "=== CONTEXTO DA SEMANA ===",
+      contextoSemana,
+      "",
+      "=== IDEIAS GLOBAIS (amostra) ===",
+      ideiasTexto ? `- ${ideiasTexto}` : "(sem ideias importadas)",
+      "",
+      "=== DIRETRIZES DO FORMATO ===",
+      promptFormato,
+      "",
+      "=== INSTRUÇÃO FINAL ===",
+      "Respeite a estrutura e a saída obrigatória do formato.",
+      "Entregue o conteúdo completo e pronto para uso.",
+    ].join("\n");
+
+    const maxTokens = MAX_OUTPUT_BY_FORMAT[tipo] ?? 1400;
 
     const body: any = {
       model: OPENAI_MODEL,
       input: [
-        { role: "system", content: promptGeral },
-        { role: "user", content: userPrompt },
+        { role: "system", content: system },
+        { role: "user", content: usuario },
       ],
-      max_output_tokens: maxTokensMap[tipo] ?? 1600,
+      max_output_tokens: maxTokens,
     };
 
     const resp = await (openai as any).responses.create(body);
+    let texto = extractText(resp);
 
-    // 7) Extrai texto (estrito)
-    const text = extractText(resp);
+    // Auto-continue para LIVE
+    if (tipo === "live") {
+      const hasAto4 = /ATO\s*4/i.test(texto) || /Ato\s*4/i.test(texto);
+      const hasAto5 = /ATO\s*5/i.test(texto) || /Ato\s*5/i.test(texto);
+      const endsEarly = !hasAto4 || !hasAto5;
 
-    if (!text) {
-      console.error("Sem conteúdo retornado - shape:", {
-        hasOutputText: !!resp?.output_text,
-        hasOutput: !!resp?.output,
-        outputType: typeof resp?.output,
-      });
-      return NextResponse.json({ ok: false, error: "Sem conteúdo retornado." }, { status: 500 });
+      if (endsEarly) {
+        const continuePrompt = buildLiveContinuePrompt(texto);
+
+        const resp2 = await (openai as any).responses.create({
+          model: OPENAI_MODEL,
+          input: [
+            { role: "system", content: system },
+            { role: "assistant", content: texto },
+            { role: "user", content: continuePrompt },
+          ],
+          max_output_tokens: Math.min(maxTokens, 1600),
+        });
+
+        const complemento = extractText(resp2);
+        if (complemento && complemento.trim()) {
+          texto = [texto.trim(), complemento.trim()].join("\n\n");
+        }
+      }
     }
 
-    return NextResponse.json({ ok: true, payload: text });
-  } catch (e: any) {
-    console.error("generate/[weekId]/[tipo] error:", e);
-    return NextResponse.json({ ok: false, error: e?.message || "Erro interno." }, { status: 500 });
+    if (!texto || !texto.trim()) {
+      return NextResponse.json({ ok: false, error: "Sem conteúdo retornado." }, { status: 400 });
+    }
+
+    // Salva geração e artifact
+    const genInsert = await supabase
+      .from("generations")
+      .insert({
+        week_id: week.id,
+        training_id_ref: training.id,
+        status: "draft",
+        payload: { tipo, text: texto, week_id: week.id },
+      })
+      .select("id")
+      .single();
+
+    const generationId = genInsert?.data?.id;
+
+    if (generationId) {
+      await supabase.from("artifacts").insert({
+        generation_id: generationId,
+        tipo,
+        indice: 1,
+        content_json: { text: texto },
+      });
+    }
+
+    return NextResponse.json({
+      ok: true,
+      generationId: generationId || null,
+      payload: texto,
+    });
+  } catch (err: any) {
+    console.error("generate/[weekId]/[tipo] error:", err?.message || err);
+    const msg = typeof err?.message === "string" ? err.message : "Erro inesperado";
+    return NextResponse.json({ ok: false, error: msg }, { status: 500 });
   }
 }
