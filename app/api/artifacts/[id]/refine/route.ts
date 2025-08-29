@@ -1,138 +1,129 @@
 // app/api/artifacts/[id]/refine/route.ts
 import { NextRequest, NextResponse } from "next/server";
-import OpenAI from "openai";
 import { supabaseServer } from "@/lib/supabaseServer";
+import { openai, OPENAI_MODEL as MODEL } from "@/lib/openai";
 
 export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
-// (opcional) menor latência no BR
-export const preferredRegion = ["gru1", "iad1"];
 
-const MODEL = process.env.OPENAI_MODEL || "gpt-5-mini";
+function extractOutputText(res: any): string {
+  // Vários formatos possíveis do SDK Responses:
+  if (typeof res?.output_text === "string") return res.output_text;
+
+  const c0 = res?.output?.[0]?.content?.[0];
+  if (c0?.type === "output_text" && typeof c0?.text === "string") return c0.text;
+
+  // Fallbacks comuns
+  if (typeof res?.content === "string") return res.content;
+  if (Array.isArray(res?.choices) && res.choices[0]?.message?.content) {
+    return String(res.choices[0].message.content);
+  }
+
+  // Último recurso: serializa
+  return JSON.stringify(res);
+}
 
 export async function POST(
   req: NextRequest,
   { params }: { params: { id: string } }
 ) {
   try {
-    const artifactId = params?.id;
+    const artifactId = params.id;
     if (!artifactId) {
-      return NextResponse.json({ ok: false, error: "Parâmetro 'id' ausente." }, { status: 400 });
+      return NextResponse.json({ ok: false, error: "Parâmetro id ausente." }, { status: 400 });
     }
 
-    const { instruction } = await req.json().catch(() => ({ instruction: "" }));
     const supabase = supabaseServer();
 
-    // 1) Pega a peça a ser refinada
-    const { data: art, error: artErr } = await supabase
+    // 1) Busca artifact
+    const { data: artifact, error: artErr } = await supabase
       .from("artifacts")
       .select("id, tipo, indice, content_json, edited_json, generation_id")
       .eq("id", artifactId)
       .single();
 
-    if (artErr || !art) {
-      return NextResponse.json({ ok: false, error: artErr?.message || "Artifact não encontrado." }, { status: 404 });
+    if (artErr || !artifact) {
+      return NextResponse.json(
+        { ok: false, error: artErr?.message || "Artifact não encontrado." },
+        { status: 404 }
+      );
     }
 
-    const contentAtual: string =
-      art.edited_json?.content ||
-      art.content_json?.content ||
-      "";
+    // 2) Lê instruções do corpo (ex: { instruction: "refaça o reels 2" , schemaName?, schema? })
+    const body = await req.json().catch(() => ({}));
+    const instruction: string = body?.instruction || "Aprimore o conteúdo mantendo intenção e formato.";
+    const schemaName: string | undefined = body?.schemaName;
+    const schema: any = body?.schema;
 
-    if (!contentAtual.trim()) {
-      return NextResponse.json({ ok: false, error: "Artifact sem conteúdo para refinar." }, { status: 400 });
-    }
+    const original = artifact.edited_json || artifact.content_json || {};
 
-    // 2) Contexto opcional da geração
-    const { data: gen } = await supabase
-      .from("generations")
-      .select("id, week_id, training_id_ref, payload")
-      .eq("id", art.generation_id)
-      .single();
+    // 3) Prompts: pedimos **APENAS JSON** se schema vier; senão, texto simples estruturado
+    const wantJSON = Boolean(schema && schemaName);
 
-    const semanaInfo = gen?.payload?.week || {};
-    const ideasSample = gen?.payload?.ideas_sample || [];
-
-    // 3) Prompts
-    const systemPrompt =
-      "Você é um editor sênior de conteúdo para Instagram. Refine mantendo formato/tópicos e limites. Não fazer promessas médicas absolutas; linguagem clara, direta e ética.";
+    const systemPrompt = [
+      "Você é um editor sênior de conteúdo para Instagram (reels, carrossel, live, post, stories).",
+      "Tarefa: refinar/reescrever mantendo intenção, persona e formato.",
+      wantJSON
+        ? "Saída OBRIGATÓRIA: APENAS JSON válido conforme o schema fornecido (sem comentários, sem markdown)."
+        : "Saída OBRIGATÓRIA: texto puro (sem markdown) com a estrutura pedida.",
+    ].join(" ");
 
     const userPrompt = [
-      `## Tipo: ${art.tipo}${art.indice ? ` #${art.indice}` : ""}`,
-      "## Conteúdo atual (refinar mantendo estrutura):",
-      contentAtual,
-      "",
-      "## Instrução específica:",
-      instruction || "Melhorar clareza, fluidez e força de copy sem mudar o formato.",
-      "",
-      "## Contexto (ajuda, opcional):",
-      JSON.stringify({ semana: semanaInfo, ideias: ideasSample }, null, 2),
-    ].join("\n");
+      `INSTRUÇÃO: ${instruction}`,
+      `TIPO: ${artifact.tipo}`,
+      `INDICE: ${artifact.indice ?? ""}`,
+      `CONTEÚDO ATUAL (JSON): ${JSON.stringify(original)}`,
+      wantJSON
+        ? `RETORNE APENAS JSON que valide neste schema: ${JSON.stringify(schema)}`
+        : "RETORNE APENAS o texto final, sem JSON, sem markdown.",
+    ].join("\n\n");
 
-    // 4) JSON Schema simples (somente 'content')
-    const schema = {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        content: { type: "string" },
-      },
-      required: ["content"],
-    };
-
-    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-    // 5) CHAMADA com CAST para evitar erro de tipos do SDK
-    const body: any = {
+    // 4) Chamada à API (sem response_format). Pedimos JSON pelo prompt quando necessário.
+    const resp = await (openai as any).responses.create({
       model: MODEL,
       input: [
         { role: "system", content: systemPrompt },
         { role: "user", content: userPrompt },
       ],
-      response_format: {
-        type: "json_schema",
-        json_schema: {
-          name: "artifact_refine",
-          schema,
-          strict: true,
-        },
-      },
-      max_output_tokens: 1200,
-    };
+      // orçamento generoso p/ refino
+      max_output_tokens: 2000,
+    });
 
-    const resp = await (openai as any).responses.create(body);
+    // 5) Extrai texto
+    const raw = extractOutputText(resp).trim();
 
-    // 6) Extrai o texto/JSON com fallback robusto
-    let textOut =
-      resp?.output_text ??
-      resp?.output?.[0]?.content?.[0]?.text ??
-      "";
-
-    if (typeof textOut !== "string") textOut = String(textOut || "").trim();
-
-    let json: { content: string };
-    try {
-      json = JSON.parse(textOut);
-    } catch {
-      json = { content: textOut };
+    // 6) Se schema foi informado, tentamos parsear JSON; senão, guardamos como { text }
+    let refined: any;
+    if (wantJSON) {
+      try {
+        refined = JSON.parse(raw);
+      } catch (e) {
+        // Se não veio JSON válido, empacota bruto para não perder o trabalho
+        refined = { _raw: raw, _note: "Falha ao parsear JSON. Revise o prompt/schema ou refine novamente." };
+      }
+    } else {
+      refined = { text: raw };
     }
 
-    const refined = (json?.content || "").trim();
-    if (!refined) {
-      return NextResponse.json({ ok: false, error: "Retorno vazio da IA." }, { status: 500 });
-    }
-
-    // 7) Salva como edição do artifact
-    const { error: updErr } = await supabase
+    // 7) Atualiza artifact (edited_json)
+    const { data: updated, error: upErr } = await supabase
       .from("artifacts")
-      .update({ edited_json: { content: refined } })
-      .eq("id", artifactId);
+      .update({
+        edited_json: refined,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", artifact.id)
+      .select()
+      .single();
 
-    if (updErr) {
-      return NextResponse.json({ ok: false, error: updErr.message }, { status: 500 });
+    if (upErr) {
+      return NextResponse.json({ ok: false, error: upErr.message }, { status: 500 });
     }
 
-    return NextResponse.json({ ok: true, content: refined });
+    return NextResponse.json({ ok: true, artifact: updated });
   } catch (e: any) {
-    return NextResponse.json({ ok: false, error: String(e?.message || e) }, { status: 500 });
+    return NextResponse.json(
+      { ok: false, error: e?.message || String(e) },
+      { status: 500 }
+    );
   }
 }
