@@ -2,241 +2,254 @@
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
 import { supabaseServer } from "@/lib/supabaseServer";
-import { OPENAI_MODEL } from "@/lib/openai";
 
 export const runtime = "nodejs";
 
-// formatos permitidos
-const ALLOWED = new Set(["reel", "post", "carrossel", "live", "stories"]);
+const MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
-// orçamentos de saída por formato (tokens aproximados)
-const MAX_OUTPUT_BY_FORMAT: Record<string, number> = {
-  reel: 1400,
-  post: 1200,
-  carrossel: 1600,
-  live: 3200,     // ↑ maior para evitar corte no ATO 4/5
-  stories: 2200,
+type StoriesSlide = {
+  kind: "texto" | "enquete" | "pergunta" | "quiz" | "cta";
+  caption: string;
+  options?: string[] | null;
 };
 
-// utilitário: extrai texto do Responses API, com vários fallbacks
-function extractText(resp: any): string {
+type StoriesDay = {
+  weekday: string;   // "Domingo"..."Sábado"
+  focus: string;     // foco do dia
+  slides: StoriesSlide[];
+};
+
+type StoriesWeek = {
+  week_title: string;
+  days: StoriesDay[]; // 7 dias
+};
+
+// ---------- pequenos utilitários ----------
+function pick<T>(v: T | undefined | null, def: T): T {
+  return v === undefined || v === null ? def : v;
+}
+
+function safeJsonParse<T>(raw: string): T | null {
   try {
-    if (typeof resp.output_text === "string" && resp.output_text.trim()) {
-      return resp.output_text;
-    }
-    const c0 = resp?.output?.[0]?.content?.[0];
-    if (c0?.type === "output_text" && typeof c0?.text === "string") {
-      return c0.text;
-    }
-    const parts: string[] = [];
-    for (const out of resp?.output ?? []) {
-      for (const c of out?.content ?? []) {
-        if (c?.type === "output_text" && typeof c?.text === "string") {
-          parts.push(c.text);
-        }
+    return JSON.parse(raw) as T;
+  } catch {
+    // tenta extrair bloco JSON entre chaves
+    const m = raw.match(/{[\s\S]*}/);
+    if (m) {
+      try {
+        return JSON.parse(m[0]) as T;
+      } catch {
+        return null;
       }
     }
-    if (parts.length) return parts.join("\n\n");
-  } catch {}
-  return "";
-}
-
-// gera um prompt de “continue” quando Live veio incompleto
-function buildLiveContinuePrompt(already: string) {
-  return [
-    "Você começou a escrever um roteiro de LIVE com 5 ATOS e parou antes de concluir.",
-    "Abaixo está o texto que você já escreveu (NÃO repita este conteúdo):",
-    "----- INÍCIO DO CONTEÚDO JÁ ESCRITO -----",
-    already,
-    "----- FIM DO CONTEÚDO JÁ ESCRITO -----",
-    "",
-    "Agora, **complete apenas o que falta** seguindo a estrutura:",
-    "• ATO 4: Recapitulação e Reforço (≈ 5 min)",
-    "  - Resuma os pontos essenciais (bullets claros).",
-    "  - Faça 1 pergunta de verificação de entendimento para engajar.",
-    "• ATO 5: Chamada Final (≈ 1 min)",
-    "  - Convite para comentar no gravado (o que ajudou).",
-    "  - Chamado para compartilhar.",
-    "",
-    "Regras:",
-    "- Não reescreva os ATOS já concluídos.",
-    "- Mantenha tom: confiança serena, didático, sem promessas absolutas.",
-    "- Entregue o texto pronto para uso, com títulos 'ATO 4' e 'ATO 5'.",
-  ].join("\n");
-}
-
-function buildContextoSemana(week: any) {
-  const sub = Array.isArray(week?.subtemas) ? week.subtemas : [];
-  const subList = sub.length ? `\nSubtemas: ${sub.join(", ")}` : "";
-  return `Semana: ${week?.semana_iso}\nTema central: ${week?.tema_central}${subList}`;
-}
-
-function pickPromptFormato(train: any, tipo: string): string {
-  switch (tipo) {
-    case "reel": return train?.prompt_reels || "";
-    case "post": return train?.prompt_post || "";
-    case "carrossel": return train?.prompt_carrossel || "";
-    case "live": return train?.prompt_live || "";
-    case "stories": return train?.prompt_stories || "";
-    default: return "";
+    return null;
   }
 }
 
-export async function POST(req: NextRequest, { params }: { params: { weekId: string; tipo: string } }) {
-  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+function fallbackStories(tema: string): StoriesWeek {
+  const dias = ["Domingo","Segunda","Terça","Quarta","Quinta","Sexta","Sábado"];
+  const simples = (d: string): StoriesDay => ({
+    weekday: d,
+    focus: `${tema} — passo prático`,
+    slides: [
+      { kind: "texto", caption: `Hoje: ${tema} na prática` },
+      { kind: "pergunta", caption: "Qual sua maior dificuldade?", options: null },
+      { kind: "enquete", caption: "Você segue isso hoje?", options: ["Sim", "Ainda não"] },
+      { kind: "cta", caption: "Salve e me mande 'AJUDA' na DM pra um passo a passo." },
+    ],
+  });
+  return { week_title: `Stories da semana — ${tema}`, days: dias.map(simples) };
+}
+
+async function getWeekAndTraining(weekId: string) {
   const supabase = supabaseServer();
 
+  // Semana
+  const { data: week, error: weekErr } = await supabase
+    .from("weeks")
+    .select("*")
+    .eq("id", weekId)
+    .maybeSingle();
+
+  if (weekErr) throw new Error(`Erro ao buscar semana: ${weekErr.message}`);
+  if (!week) throw new Error("Semana não encontrada.");
+
+  // Treinamento (pega o mais recente)
+  const { data: training, error: trErr } = await supabase
+    .from("trainings")
+    .select("*")
+    .order("updated_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (trErr) throw new Error(`Erro ao buscar treinamento: ${trErr.message}`);
+
+  return { week, training };
+}
+
+// ---------- prompts ----------
+function buildStoriesSystemPrompt(custom?: string) {
+  const base =
+    "Você escreve roteiros de Instagram Stories claros, curtos e envolventes, com foco em educação em saúde e emagrecimento. Mantenha tom: confiança serena, didático, empático, sem hype. Frases curtas. Sem promessas absolutas. Sempre indique que é conteúdo informativo e não substitui avaliação individual.";
+
+  if (custom && custom.trim()) return `${base}\n\nContexto extra do autor:\n${custom.trim()}`;
+  return base;
+}
+
+function buildStoriesUserPrompt(tema: string, subtemas: string[]) {
+  return `
+Tema central da semana: ${tema}
+Subtemas (pautas de apoio): ${subtemas && subtemas.length ? subtemas.join(", ") : "—"}
+
+Crie um PLANO DE 7 DIAS de Stories (Dom→Sáb). Para cada dia:
+- "weekday": dia da semana por extenso (Domingo...Sábado)
+- "focus": frase breve do foco do dia
+- "slides": 3–6 cards
+  * cada slide tem:
+    - "kind": "texto" | "enquete" | "pergunta" | "quiz" | "cta"
+    - "caption": texto curto (máx. ~20 palavras)
+    - "options": só quando for "enquete" ou "quiz" (2–4 opções)
+- evite blocos longos; priorize frases curtas
+- mantenha linguagem simples
+- 1 CTA leve por dia (ex.: "responda a caixinha", "salve", "me chame na DM")
+- Avise implicitamente que é conteúdo informativo
+
+Respeite estritamente o schema pedido (JSON).`;
+}
+
+export async function POST(
+  req: NextRequest,
+  { params }: { params: { weekId: string; tipo: string } }
+) {
   try {
-    const weekId = params.weekId;
-    const tipo = (params.tipo || "").toLowerCase();
+    const { weekId, tipo } = params;
 
-    if (!ALLOWED.has(tipo)) {
-      return NextResponse.json({ ok: false, error: `Formato inválido: ${tipo}` }, { status: 400 });
+    if (!weekId || !tipo) {
+      return NextResponse.json(
+        { ok: false, error: "Parâmetros ausentes." },
+        { status: 400 }
+      );
     }
 
-    // 1) Carrega semana
-    const { data: week, error: eWeek } = await supabase
-      .from("weeks")
-      .select("*")
-      .eq("id", weekId)
-      .single();
-
-    if (eWeek || !week) {
-      return NextResponse.json({ ok: false, error: "Semana não encontrada." }, { status: 404 });
+    // Por enquanto focamos no STORIES; os demais seguem seu fluxo já existente do app.
+    if (tipo !== "stories") {
+      return NextResponse.json(
+        { ok: false, error: "Formato não suportado nesta rota (ajuste aplicado apenas para 'stories')." },
+        { status: 400 }
+      );
     }
 
-    // 2) Carrega o treinamento mais recente
-    const { data: trainings, error: eTr } = await supabase
-      .from("trainings")
-      .select("*")
-      .order("updated_at", { ascending: false })
-      .limit(1);
+    const { week, training } = await getWeekAndTraining(weekId);
+    const tema = pick<string>(week?.tema_central, "Tema da semana");
+    const subtemas = Array.isArray(week?.subtemas) ? (week.subtemas as string[]) : [];
 
-    if (eTr || !trainings?.length) {
-      return NextResponse.json({ ok: false, error: "Treinamento não encontrado. Preencha em /treinamentos." }, { status: 400 });
-    }
+    const systemPrompt = buildStoriesSystemPrompt(training?.prompt_stories || training?.prompt_geral);
+    const userPrompt = buildStoriesUserPrompt(tema, subtemas);
 
-    const training = trainings[0];
-    const promptGeral = (training?.prompt_geral || "").trim();
-    const promptFormato = (pickPromptFormato(training, tipo) || "").trim();
+    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-    if (!promptFormato) {
-      return NextResponse.json({ ok: false, error: `Prompt do formato (${tipo}) não preenchido em /treinamentos.` }, { status: 400 });
-    }
+    // JSON Schema para garantir consistência
+    const schema: any = {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        week_title: { type: "string" },
+        days: {
+          type: "array",
+          minItems: 7,
+          maxItems: 7,
+          items: {
+            type: "object",
+            additionalProperties: false,
+            required: ["weekday", "focus", "slides"],
+            properties: {
+              weekday: { type: "string" },
+              focus: { type: "string" },
+              slides: {
+                type: "array",
+                minItems: 3,
+                maxItems: 8,
+                items: {
+                  type: "object",
+                  additionalProperties: false,
+                  required: ["kind", "caption"],
+                  properties: {
+                    kind: { type: "string", enum: ["texto", "enquete", "pergunta", "quiz", "cta"] },
+                    caption: { type: "string" },
+                    options: {
+                      type: ["array", "null"],
+                      items: { type: "string" }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      required: ["week_title", "days"]
+    };
 
-    // 3) Contexto de ideias (opcional: amostra simples)
-    const { data: ideas } = await supabase
-      .from("ideas")
-      .select("texto")
-      .order("created_at", { ascending: false })
-      .limit(10);
-
-    const ideiasTexto = (ideas || [])
-      .map((i: any) => i?.texto)
-      .filter(Boolean)
-      .join("\n- ");
-
-    // 4) Prompt final
-    const contextoSemana = buildContextoSemana(week);
-    const system = [
-      "Você é um estrategista de conteúdo que escreve em PT-BR, tom: confiança serena, didático, empático, ético.",
-      "Evite promessas absolutas e jargão; se usar termo médico, explique em 1 linha simples.",
-      "Siga fielmente as orientações do prompt específico do formato.",
-    ].join("\n");
-
-    const usuario = [
-      "=== TREINAMENTO GERAL ===",
-      promptGeral || "(vazio)",
-      "",
-      "=== CONTEXTO DA SEMANA ===",
-      contextoSemana,
-      "",
-      "=== IDEIAS GLOBAIS (amostra) ===",
-      ideiasTexto ? `- ${ideiasTexto}` : "(sem ideias importadas)",
-      "",
-      "=== DIRETRIZES DO FORMATO ===",
-      promptFormato,
-      "",
-      "=== INSTRUÇÃO FINAL ===",
-      "Respeite a estrutura e a saída obrigatória do formato.",
-      "Entregue o conteúdo completo e pronto para uso.",
-    ].join("\n");
-
-    const maxTokens = MAX_OUTPUT_BY_FORMAT[tipo] ?? 1400;
-
+    // Corpo da requisição (compat com SDK)
     const body: any = {
-      model: OPENAI_MODEL,
+      model: MODEL,
       input: [
-        { role: "system", content: system },
-        { role: "user", content: usuario },
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt }
       ],
-      max_output_tokens: maxTokens,
+      response_format: {
+        type: "json_schema",
+        json_schema: {
+          name: "stories_week",
+          schema,
+          strict: true
+        }
+      },
+      max_output_tokens: 2200
     };
 
     const resp = await (openai as any).responses.create(body);
-    let texto = extractText(resp);
 
-    // Auto-continue para LIVE
-    if (tipo === "live") {
-      const hasAto4 = /ATO\s*4/i.test(texto) || /Ato\s*4/i.test(texto);
-      const hasAto5 = /ATO\s*5/i.test(texto) || /Ato\s*5/i.test(texto);
-      const endsEarly = !hasAto4 || !hasAto5;
+    // Tenta extrair texto/JSON de forma robusta
+    const raw =
+      (resp?.output_text as string) ||
+      (resp?.content?.[0]?.text as string) ||
+      JSON.stringify(resp);
 
-      if (endsEarly) {
-        const continuePrompt = buildLiveContinuePrompt(texto);
+    let parsed = safeJsonParse<StoriesWeek>(raw);
 
-        const resp2 = await (openai as any).responses.create({
-          model: OPENAI_MODEL,
-          input: [
-            { role: "system", content: system },
-            { role: "assistant", content: texto },
-            { role: "user", content: continuePrompt },
-          ],
-          max_output_tokens: Math.min(maxTokens, 1600),
-        });
-
-        const complemento = extractText(resp2);
-        if (complemento && complemento.trim()) {
-          texto = [texto.trim(), complemento.trim()].join("\n\n");
-        }
-      }
+    if (!parsed || !parsed?.days || parsed.days.length !== 7) {
+      // fallback seguro (nunca devolve vazio)
+      parsed = fallbackStories(tema);
     }
 
-    if (!texto || !texto.trim()) {
-      return NextResponse.json({ ok: false, error: "Sem conteúdo retornado." }, { status: 400 });
-    }
-
-    // Salva geração e artifact
-    const genInsert = await supabase
-      .from("generations")
-      .insert({
-        week_id: week.id,
-        training_id_ref: training.id,
-        status: "draft",
-        payload: { tipo, text: texto, week_id: week.id },
-      })
-      .select("id")
-      .single();
-
-    const generationId = genInsert?.data?.id;
-
-    if (generationId) {
-      await supabase.from("artifacts").insert({
-        generation_id: generationId,
-        tipo,
-        indice: 1,
-        content_json: { text: texto },
-      });
-    }
+    // Normaliza mínimas garantias
+    parsed.week_title = pick(parsed.week_title, `Stories — ${tema}`);
+    parsed.days = parsed.days.map((d, i) => ({
+      weekday: pick(d.weekday, ["Domingo","Segunda","Terça","Quarta","Quinta","Sexta","Sábado"][i] || "Dia"),
+      focus: pick(d.focus, tema),
+      slides: (d.slides || []).map(s => ({
+        kind: (["texto","enquete","pergunta","quiz","cta"] as const).includes(s.kind as any)
+          ? s.kind
+          : "texto",
+        caption: pick(s.caption, "Texto"),
+        options: s.kind === "enquete" || s.kind === "quiz" ? pick(s.options ?? null, ["Sim","Não"]) : null
+      })).slice(0, 8)
+    })).slice(0, 7);
 
     return NextResponse.json({
       ok: true,
-      generationId: generationId || null,
-      payload: texto,
+      payload: {
+        tipo: "stories",
+        tema,
+        data: parsed
+      }
     });
   } catch (err: any) {
-    console.error("generate/[weekId]/[tipo] error:", err?.message || err);
-    const msg = typeof err?.message === "string" ? err.message : "Erro inesperado";
-    return NextResponse.json({ ok: false, error: msg }, { status: 500 });
+    console.error("ERRO /generate/[weekId]/[tipo]:", err?.message || err);
+    return NextResponse.json(
+      { ok: false, error: err?.message || "Falha inesperada." },
+      { status: 500 }
+    );
   }
 }

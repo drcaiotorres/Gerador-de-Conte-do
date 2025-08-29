@@ -1,0 +1,15 @@
+{
+  "version": 2,
+  "functions": {
+    "api/**": {
+      "runtime": "nodejs20.x",
+      "memory": 1024,
+      "maxDuration": 300
+    },
+    "app/api/**": {
+      "runtime": "nodejs20.x",
+      "memory": 1024,
+      "maxDuration": 300
+    }
+  }
+}
