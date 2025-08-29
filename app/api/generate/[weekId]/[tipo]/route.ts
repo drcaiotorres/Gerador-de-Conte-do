@@ -2,240 +2,166 @@
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
 import { supabaseServer } from "@/lib/supabaseServer";
+import { OPENAI_MODEL } from "@/lib/openai";
 
 export const runtime = "nodejs";
+export const maxDuration = 300;
 
-type Params = { weekId: string; tipo: "reel" | "post" | "stories" | "carrossel" | "live" };
+const MODEL = OPENAI_MODEL; // ex.: "gpt-4.1-mini"
 
-// ---------- Helpers ----------
-function extractText(resp: any): string {
-  if (typeof resp?.output_text === "string" && resp.output_text.trim()) return resp.output_text;
+type TipoFormato = "reels" | "post" | "carrossel" | "live" | "stories";
 
-  const out = resp?.output ?? resp?.outputs ?? resp?.data?.output;
-  let acc = "";
-  if (Array.isArray(out)) {
-    for (const item of out) {
-      const content = item?.content ?? item?.contents;
-      if (Array.isArray(content)) {
-        for (const c of content) {
-          if (typeof c?.text === "string") acc += c.text;
-          else if (c?.type === "output_text" && typeof c?.text === "string") acc += c.text;
-          else if (typeof c?.content === "string") acc += c.content;
-        }
-      } else if (typeof item?.text === "string") {
-        acc += item.text;
-      }
-    }
+function buildOutputInstruction(tipo: TipoFormato) {
+  // Pedimos TEXTO PURO (markdown) — sem JSON, sem schemas
+  switch (tipo) {
+    case "reels":
+      return `Retorne o roteiro final **em texto corrido markdown**, já estruturado nos tópicos exigidos do seu prompt de REELS. Não inclua comentários de sistema.`;
+    case "post":
+      return `Retorne o conteúdo final **em texto corrido markdown** (post estático), com título, linha de apoio, corpo e CTA conforme seu prompt de POST.`;
+    case "carrossel":
+      return `Retorne **apenas** o carrossel final como markdown, com "Slide 1:", "Slide 2:" ... e o texto de cada slide.`;
+    case "live":
+      return `Retorne a live completa **em markdown**, com ATO 1 a ATO 5, tópicos claros e falas sucintas.`;
+    case "stories":
+      return `Retorne a grade de 7 dias **em markdown**, nomeando cada dia (Domingo a Sábado) e listando os quadros (enquete, caixinha, CTA etc.).`;
+    default:
+      return `Retorne o conteúdo final em **markdown**.`;
   }
-  if (!acc && typeof resp?.text === "string") acc = resp.text;
-  if (!acc && resp?.message?.content) {
-    const mc = resp.message.content;
-    if (Array.isArray(mc)) for (const m of mc) if (typeof m?.text === "string") acc += m.text;
-    else if (typeof mc === "string") acc = mc;
-  }
-  return acc;
 }
 
-const WEEKDAYS = ["Segunda","Terça","Quarta","Quinta","Sexta","Sábado","Domingo"] as const;
-type Weekday = typeof WEEKDAYS[number];
-
-function sortDias(dias: any[]) {
-  const order = new Map(WEEKDAYS.map((d, i) => [d, i]));
-  return [...dias].sort((a, b) => (order.get(a?.dia) ?? 99) - (order.get(b?.dia) ?? 99));
-}
-
-// ---------- Schemas ----------
-function storiesJSONSchema() {
-  return {
-    name: "stories_schema",
-    schema: {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        titulo_serie: { type: "string" },
-        resumo_semana: { type: "string" },
-        dias: {
-          type: "array",
-          minItems: 7,
-          maxItems: 7,
-          items: {
-            type: "object",
-            additionalProperties: false,
-            properties: {
-              dia: { type: "string", enum: WEEKDAYS as unknown as string[] },
-              titulo: { type: "string" },
-              roteiro: { type: "string" },
-              enquetes: { type: "array", items: { type: "string" }, default: [] },
-              perguntas: { type: "array", items: { type: "string" }, default: [] },
-              cta: { type: "string" }
-            },
-            required: ["dia", "titulo", "roteiro", "cta"]
-          }
-        }
-      },
-      required: ["titulo_serie", "dias"]
-    },
-    strict: true as const
-  };
-}
-
-function markdownSchemaFor(tipo: Params["tipo"]) {
-  return {
-    name: `${tipo}_markdown`,
-    schema: {
-      type: "object",
-      additionalProperties: false,
-      properties: { markdown: { type: "string" } },
-      required: ["markdown"]
-    },
-    strict: true as const
-  };
-}
-
-// ---------- Prompts ----------
-function systemPrompt(tipo: Params["tipo"]) {
-  return [
-    "Você é redator médico do Dr. Caio Torres (emagrecimento).",
-    "Tom: confiança serena, didático, empático, linguagem simples.",
-    "Evite jargões; quando usar, explique em 1 linha.",
-    "Não prometa resultados absolutos. Inclua aviso de saúde quando adequado.",
-    `Formato solicitado: ${tipo}. Responda SEMPRE em PT-BR.`,
-  ].join("\n");
-}
-
-function userPrompt(
-  tipo: Params["tipo"],
-  tema: string,
-  subtemas: string[],
-  promptGeral?: string,
-  promptFormato?: string
+export async function POST(
+  req: NextRequest,
+  { params }: { params: { weekId: string; tipo: TipoFormato } }
 ) {
-  const base = [
-    `Tema central da semana: "${tema}".`,
-    subtemas?.length ? `Subtemas: ${subtemas.join(" | ")}` : `Sem subtemas adicionais.`,
-    promptGeral ? `Diretriz geral: ${promptGeral}` : ``,
-    promptFormato ? `Diretriz do formato: ${promptFormato}` : ``,
-  ].filter(Boolean).join("\n");
-
-  if (tipo === "stories") {
-    return [
-      base,
-      "",
-      "Regras FIXAS de programação dos Stories:",
-      "- Segunda-feira: sempre abrir com CAIXA DE PERGUNTAS (sobre o tema da semana).",
-      "- Quinta-feira: lembrar da LIVE (com CTA claro para definir lembrete).",
-      "",
-      "Agora gere a série completa de 7 dias (Segunda → Domingo), obedecendo:",
-      "- Cada dia deve conter: dia, título curto, roteiro (texto corrido dos slides), 0–2 enquetes, 0–2 perguntas de caixinha e 1 CTA.",
-      "- Seja prático e acionável; 3–5 pontos/ações implícitas no roteiro.",
-      "- Mantenha consistência com o tema e subtemas.",
-      "",
-      "IMPORTANTE: Entregue no formato do JSON Schema solicitado (titulo_serie, resumo_semana, dias[7])."
-    ].join("\n");
-  }
-
-  return [
-    base,
-    "Entregue o conteúdo final em MARKDOWN pronto para colar."
-  ].join("\n");
-}
-
-// ---------- Handler ----------
-export async function POST(req: NextRequest, { params }: { params: Params }) {
   try {
     const { weekId, tipo } = params;
-
-    if (!["reel", "post", "stories", "carrossel", "live"].includes(tipo)) {
-      return NextResponse.json({ ok: false, error: "Tipo inválido." }, { status: 400 });
+    if (!weekId || !tipo) {
+      return NextResponse.json({ ok: false, error: "Parâmetros inválidos." }, { status: 400 });
     }
 
-    // Semana
-    const supa = supabaseServer();
-    const { data: week, error: werr } = await supa
+    const supabase = supabaseServer();
+
+    // 1) Semana selecionada
+    const { data: week, error: weekErr } = await supabase
       .from("weeks")
       .select("*")
       .eq("id", weekId)
       .single();
 
-    if (werr || !week) {
+    if (weekErr || !week) {
       return NextResponse.json({ ok: false, error: "Semana não encontrada." }, { status: 404 });
     }
 
-    // Treinamento (mais recente)
-    const { data: training } = await supa
+    // 2) Treinamentos (pegamos o mais recente)
+    const { data: training, error: trErr } = await supabase
       .from("trainings")
       .select("*")
       .order("updated_at", { ascending: false })
       .limit(1)
       .maybeSingle();
 
-    const mapKey: Record<string, keyof typeof training> = {
-      reel: "prompt_reels",
-      post: "prompt_post",
-      carrossel: "prompt_carrossel",
-      live: "prompt_live",
-      stories: "prompt_stories",
-    };
-    const promptFormato = training ? (training as any)[mapKey[tipo]] : "";
-    const promptGeral = training?.prompt_geral || "";
+    if (trErr) {
+      return NextResponse.json({ ok: false, error: "Falha ao ler treinamentos." }, { status: 500 });
+    }
 
-    const tema = week.tema_central || "";
-    const subtemas = Array.isArray(week.subtemas) ? week.subtemas : [];
+    const promptGeral = training?.prompt_geral || "";
+    const promptPorFormato =
+      tipo === "reels" ? training?.prompt_reels
+      : tipo === "post" ? training?.prompt_post
+      : tipo === "carrossel" ? training?.prompt_carrossel
+      : tipo === "live" ? training?.prompt_live
+      : tipo === "stories" ? training?.prompt_stories
+      : "";
+
+    // 3) Amostra de ideias globais para inspirar (sem embeddings)
+    const { data: ideas } = await supabase
+      .from("ideas")
+      .select("texto")
+      .order("created_at", { ascending: false })
+      .limit(30);
+
+    const ideiasLista = (ideas || []).map(i => `- ${i.texto}`).join("\n");
+
+    // 4) Monta o comando ao modelo
+    const outputInstruction = buildOutputInstruction(tipo);
+    const contextoSemana = `SEMANA: ${week.semana_iso}\nTEMA CENTRAL: ${week.tema_central}\nSUBTEMAS: ${(Array.isArray(week.subtemas) ? week.subtemas.join(", ") : "")}`;
+    const bancoIdeias = ideiasLista ? `IDEIAS GLOBAIS (amostra):\n${ideiasLista}` : `IDEIAS GLOBAIS: (sem amostra)`;    
+
+    const systemPrompt = [
+      "Você é um estrategista de conteúdo que escreve em PT-BR, tom confiante, didático e empático.",
+      "Siga à risca as regras do Treinamento Geral e do Prompt do Formato.",
+      "O conteúdo deve ser substancial e prático. Evite jargões não explicados.",
+      "A SAÍDA DEVE SER ESTRITAMENTE EM TEXTO MARKDOWN. NÃO RETORNE JSON.",
+    ].join("\n");
+
+    const userPrompt = [
+      "=== CONTEXTO DA SEMANA ===",
+      contextoSemana,
+      "",
+      "=== TREINAMENTO GERAL ===",
+      promptGeral || "(não fornecido)",
+      "",
+      "=== PROMPT DO FORMATO ===",
+      promptPorFormato || "(não fornecido)",
+      "",
+      "=== BANCO DE IDEIAS (AMOSTRA) ===",
+      bancoIdeias,
+      "",
+      "=== INSTRUÇÃO DE SAÍDA ===",
+      outputInstruction,
+      "",
+      "Importante: entregue APENAS o texto final, pronto para colar. Sem explicações adicionais."
+    ].join("\n");
 
     const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-    const model = process.env.OPENAI_MODEL || "gpt-4.1-mini";
 
-    const system = systemPrompt(tipo);
-    const user = userPrompt(tipo, tema, subtemas, promptGeral, promptFormato);
-
+    // 5) Chamada ao Responses API sem response_format/text.format
     const body: any = {
-      model,
+      model: MODEL,
       input: [
-        { role: "system", content: system },
-        { role: "user", content: user }
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
       ],
-      max_output_tokens: tipo === "live" ? 5500 : 2200
+      // Não enviar temperature custom se seu modelo não aceitar:
+      // max_output_tokens ajuda a evitar truncamento
+      max_output_tokens: 2200,
     };
 
-    if (tipo === "stories") {
-      // Força JSON estruturado com 7 dias
-      const { name, schema, strict } = storiesJSONSchema();
-      body.text = { format: "json_schema", json_schema: { name, schema, strict } };
-    } else {
-      // demais formatos: markdown simples
-      const { name, schema, strict } = markdownSchemaFor(tipo);
-      body.text = { format: "json_schema", json_schema: { name, schema, strict } };
-    }
-
     const resp = await (openai as any).responses.create(body);
-    const raw = extractText(resp);
-    if (!raw || !raw.trim()) {
-      return NextResponse.json({ ok: false, error: "Sem conteúdo retornado do modelo." }, { status: 400 });
+
+    // 6) Extrai string de maneira robusta
+    const md =
+      (resp as any)?.output_text ||
+      (resp as any)?.content?.[0]?.text ||
+      (resp as any)?.output?.[0]?.content?.[0]?.text ||
+      "";
+
+    if (!md || !String(md).trim()) {
+      return NextResponse.json({ ok: false, error: "Sem conteúdo retornado." }, { status: 400 });
     }
 
-    // Tenta parsear JSON (quando pedimos schema). Se falhar, cai como markdown simples
-    let payload: any = null;
-    try {
-      payload = JSON.parse(raw);
-    } catch {
-      payload = { markdown: raw };
+    // 7) Salva um "generation" simples (opcional)
+    const { data: gen, error: genErr } = await supabase
+      .from("generations")
+      .insert({
+        week_id: week.id,
+        status: "draft",
+        payload: { md, tipo },
+      })
+      .select()
+      .single();
+
+    if (genErr) {
+      // Não bloqueia o retorno do conteúdo ao usuário
+      return NextResponse.json({ ok: true, payload: { md }, generation_id: null });
     }
 
-    // Se for stories e o modelo teimar, repara a ordem e checa contagem
-    if (tipo === "stories" && payload?.dias && Array.isArray(payload.dias)) {
-      payload.dias = sortDias(payload.dias);
-      if (payload.dias.length !== 7) {
-        // Proteção mínima: se vier menos, devolve erro amigável
-        return NextResponse.json(
-          { ok: false, error: `Modelo retornou ${payload.dias.length}/7 dias. Tente gerar novamente.` },
-          { status: 400 }
-        );
-      }
-    }
-
-    return NextResponse.json({ ok: true, payload }, { status: 200 });
+    return NextResponse.json({ ok: true, payload: { md }, generation_id: gen.id });
   } catch (err: any) {
-    const msg = err?.message || "Erro interno";
-    return NextResponse.json({ ok: false, error: msg }, { status: 500 });
+    console.error("generate error:", err);
+    return NextResponse.json(
+      { ok: false, error: err?.message || "Erro ao gerar conteúdo." },
+      { status: 500 }
+    );
   }
 }
