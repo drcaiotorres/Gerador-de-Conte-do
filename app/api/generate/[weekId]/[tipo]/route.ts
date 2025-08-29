@@ -192,19 +192,21 @@ export async function POST(
 
     // Corpo da requisição (compat com SDK)
     const body: any = {
-      model: MODEL,
-      input: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt }
-      ],
-      response_format: {
-        type: "json_schema",
-        json_schema: {
-          name: "stories_week",
-          schema,
-          strict: true
-        }
+  model: MODEL,
+  input: [
+    { role: "system", content: systemPrompt },
+    { role: "user", content: userPrompt },
+  ],
+  text: {                   // <--- NOVO LOCAL
+    format: {
+      type: "json_schema",
+      json_schema: {
+        name: schemaName || "out_schema",
+        schema,
+        strict: true,
       },
+    },
+  },
       max_output_tokens: 2200
     };
 
