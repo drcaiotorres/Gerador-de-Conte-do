@@ -1,8 +1,4 @@
 {
-  "version": 2,
-  "regions": ["gru1"],
-  "functions": {
-    "api/**":     { "maxDuration": 300, "memory": 1024 },
-    "app/api/**": { "maxDuration": 300, "memory": 1024 }
-  }
+  "version": 2
 }
+
